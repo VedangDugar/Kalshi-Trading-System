@@ -1,0 +1,117 @@
+# Kalshi Trading System - full-stack portfolio prototype.
+# One command runs the whole thing:  docker compose up --build
+#
+# Service graph:
+#   redis        - shared state bus between Python + C++
+#   spark        - one-shot PySpark ingestion job -> Parquet feature lake
+#   ml           - LSTM(TF)+Transformer(PyTorch) ensemble, odds, Kelly, backtest
+#   marketdata   - ZeroMQ publisher simulating 3 venues' order books
+#   engine       - C++17 Boost.Asio/ZeroMQ/Redis arbitrage engine
+#   dashboard    - Streamlit demo UI (http://localhost:8501)
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: kalshi-redis
+    ports:
+      - "6379:6379"      # exposed for local debugging (redis-cli)
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # One-shot Spark job: ingest weather + market data -> partitioned Parquet.
+  spark:
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile
+    container_name: kalshi-spark
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_HOST=redis
+      - NOAA_TOKEN=${NOAA_TOKEN:-}
+    volumes:
+      - ./:/app
+    working_dir: /app
+    # Run in Spark local mode as a plain Python app (pyspark launches its own
+    # JVM); master is set in code via SPARK_MASTER (default local[*]).
+    command: python /app/ingestion/spark_ingest.py
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ML ensemble + strategy + backtest. Waits for Spark ingestion to finish.
+  ml:
+    build:
+      context: .
+      dockerfile: ml/Dockerfile
+    container_name: kalshi-ml
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_HOST=redis
+      - OMP_NUM_THREADS=2
+      - TF_CPP_MIN_LOG_LEVEL=3
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: python -m ml.run_pipeline
+    depends_on:
+      redis:
+        condition: service_healthy
+      spark:
+        condition: service_completed_successfully
+
+  # ZeroMQ market-data simulator (3 correlated venues, injected arb spreads).
+  marketdata:
+    build:
+      context: .
+      dockerfile: marketdata/Dockerfile
+    container_name: kalshi-marketdata
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_HOST=redis
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: python -m marketdata.publisher
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # C++17 low-latency arbitrage engine.
+  engine:
+    build:
+      context: ./engine
+      dockerfile: Dockerfile
+    container_name: kalshi-engine
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MD_PUB_HOST=marketdata
+      - MD_PUB_PORT=5556
+    depends_on:
+      redis:
+        condition: service_healthy
+      marketdata:
+        condition: service_started
+    restart: unless-stopped   # demonstrates the "auto-recover -> high uptime" story
+
+  # Streamlit demo dashboard.
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: kalshi-dashboard
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_HOST=redis
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: streamlit run dashboard/app.py --server.address=0.0.0.0 --server.port=8501
+    depends_on:
+      redis:
+        condition: service_healthy

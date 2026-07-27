@@ -1,0 +1,14 @@
+# Core numerics / data
+numpy<2
+pandas>=2.0
+pyarrow>=14
+
+# Infra
+redis>=5.0
+requests>=2.31
+
+# Modeling
+tensorflow-cpu==2.15.1
+optuna>=3.5
+# NOTE: PyTorch (CPU build) is installed separately in the Dockerfile from the
+# official CPU wheel index to avoid pulling the large CUDA packages.
